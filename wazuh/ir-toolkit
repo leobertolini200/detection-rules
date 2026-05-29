@@ -1,0 +1,307 @@
+#!/bin/bash
+#
+# check-ip.sh — IP Enrichment Tool for SOC Incident Triage
+# ---------------------------------------------------------
+# Fetches reputation data from AbuseIPDB and VirusTotal in parallel,
+# then outputs a color-coded verdict with key indicators.
+#
+# Usage:
+#   export ABUSEIPDB_API_KEY="your_key"
+#   export VT_API_KEY="your_key"
+#   ./check-ip.sh <IP_ADDRESS>
+#
+# Exit codes:
+#   0 = CLEAN
+#   1 = SUSPICIOUS
+#   2 = MALICIOUS
+
+set -o pipefail
+
+# --- Color definitions ---
+GREEN="\033[0;32m"
+YELLOW="\033[1;33m"
+RED="\033[0;31m"
+NC="\033[0m"   # No Color
+
+# --- Helper functions ---
+usage() {
+    echo "Usage: $0 <IP_ADDRESS>"
+    echo "Queries AbuseIPDB and VirusTotal for IP enrichment."
+    exit 1
+}
+
+err() {
+    echo -e "${RED}[ERROR]${NC} $1" >&2
+}
+
+warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1" >&2
+}
+
+info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+# Check prerequisites: jq must be installed
+if ! command -v jq &>/dev/null; then
+    err "jq is not installed. Please install jq (e.g., apt install jq or brew install jq)."
+    exit 1
+fi
+
+# --- Argument validation ---
+if [[ $# -ne 1 ]]; then
+    usage
+fi
+
+IP="$1"
+
+# Validate IP format (simple regex for IPv4)
+if ! [[ $IP =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    err "Invalid IP address format: $IP"
+    exit 1
+fi
+
+# Check each octet is 0-255
+IFS='.' read -r o1 o2 o3 o4 <<< "$IP"
+for octet in "$o1" "$o2" "$o3" "$o4"; do
+    if (( octet < 0 || octet > 255 )); then
+        err "Invalid IP address (octet out of range): $IP"
+        exit 1
+    fi
+done
+
+# --- API Key checks ---
+ABUSEIPDB_API_KEY="${ABUSEIPDB_API_KEY:-}"
+VT_API_KEY="${VT_API_KEY:-}"
+
+if [[ -z "$ABUSEIPDB_API_KEY" ]]; then
+    warn "ABUSEIPDB_API_KEY not set. Skipping AbuseIPDB lookup."
+fi
+if [[ -z "$VT_API_KEY" ]]; then
+    warn "VT_API_KEY not set. Skipping VirusTotal lookup."
+fi
+
+if [[ -z "$ABUSEIPDB_API_KEY" && -z "$VT_API_KEY" ]]; then
+    err "At least one API key must be set. Export ABUSEIPDB_API_KEY and/or VT_API_KEY."
+    exit 1
+fi
+
+# --- Variables for parallel results ---
+abuseipdb_result=""
+virustotal_result=""
+
+# --- Function: Query AbuseIPDB ---
+query_abuseipdb() {
+    local ip="$1"
+    if [[ -z "$ABUSEIPDB_API_KEY" ]]; then
+        echo "SKIPPED"
+        return
+    fi
+
+    # AbuseIPDB API endpoint (check/v2 API)
+    local url="https://api.abuseipdb.com/api/v2/check"
+    local response
+    response=$(curl -s -S --max-time 10 \
+        -H "Key: $ABUSEIPDB_API_KEY" \
+        -H "Accept: application/json" \
+        -G --data-urlencode "ipAddress=$ip" \
+        --data-urlencode "maxAgeInDays=90" \
+        --data-urlencode "verbose" \
+        "$url" 2>&1)
+
+    local curl_exit=$?
+    if [[ $curl_exit -ne 0 ]]; then
+        echo "CURL_ERROR: $response"
+        return
+    fi
+
+    # Parse response
+    local data
+    data=$(echo "$response" | jq -c '.data // empty' 2>/dev/null)
+    if [[ -z "$data" ]]; then
+        echo "PARSE_ERROR: Invalid or empty response"
+        return
+    fi
+
+    # Extract fields
+    local isp domain countryCode abuseConfidenceScore totalReports lastReportedAt categories
+    isp=$(echo "$data" | jq -r '.isp // "N/A"')
+    domain=$(echo "$data" | jq -r '.domain // "N/A"')
+    countryCode=$(echo "$data" | jq -r '.countryCode // "N/A"')
+    abuseConfidenceScore=$(echo "$data" | jq -r '.abuseConfidenceScore // 0')
+    totalReports=$(echo "$data" | jq -r '.totalReports // 0')
+    lastReportedAt=$(echo "$data" | jq -r '.lastReportedAt // "N/A"')
+    categories=$(echo "$data" | jq -r '[.reports[].categories[]] | unique | join(", ") // "N/A"')
+
+    # Assemble summary string (tab-delimited for easy parsing later)
+    # Format: ISP|Domain|Country|Score|Reports|LastReported|Categories
+    echo "ISP=$isp|Domain=$domain|Country=$countryCode|Score=$abuseConfidenceScore|Reports=$totalReports|LastReported=$lastReportedAt|Categories=$categories"
+}
+
+# --- Function: Query VirusTotal ---
+query_virustotal() {
+    local ip="$1"
+    if [[ -z "$VT_API_KEY" ]]; then
+        echo "SKIPPED"
+        return
+    fi
+
+    # VirusTotal API v3 endpoint
+    local url="https://www.virustotal.com/api/v3/ip_addresses/$ip"
+    local response
+    response=$(curl -s -S --max-time 10 \
+        -H "x-apikey: $VT_API_KEY" \
+        "$url" 2>&1)
+
+    local curl_exit=$?
+    if [[ $curl_exit -ne 0 ]]; then
+        echo "CURL_ERROR: $response"
+        return
+    fi
+
+    local data
+    data=$(echo "$response" | jq -c '.data.attributes // empty' 2>/dev/null)
+    if [[ -z "$data" ]]; then
+        echo "PARSE_ERROR: Invalid or empty response"
+        return
+    fi
+
+    # Extract fields
+    local malicious suspicious undetected last_analysis_date asn country
+    malicious=$(echo "$data" | jq -r '.last_analysis_stats.malicious // 0')
+    suspicious=$(echo "$data" | jq -r '.last_analysis_stats.suspicious // 0')
+    undetected=$(echo "$data" | jq -r '.last_analysis_stats.undetected // 0')
+    last_analysis_date=$(echo "$data" | jq -r '.last_analysis_date // 0')
+
+    # Convert Unix timestamp to readable date if not zero
+    if [[ "$last_analysis_date" -ne 0 ]]; then
+        last_analysis_date=$(date -u -d "@$last_analysis_date" "+%Y-%m-%d %H:%M UTC" 2>/dev/null || echo "N/A")
+    else
+        last_analysis_date="N/A"
+    fi
+
+    asn=$(echo "$data" | jq -r '.asn // "N/A"')
+    country=$(echo "$data" | jq -r '.country // "N/A"')
+
+    echo "Malicious=$malicious|Suspicious=$suspicious|Undetected=$undetected|LastAnalysis=$last_analysis_date|ASN=$asn|Country=$country"
+}
+
+# --- Run both queries in parallel ---
+# Start AbuseIPDB in background (if enabled)
+if [[ -n "$ABUSEIPDB_API_KEY" ]]; then
+    query_abuseipdb "$IP" > /tmp/abuseipdb_result.$$ &
+    abuse_pid=$!
+fi
+
+# Start VirusTotal in background (if enabled)
+if [[ -n "$VT_API_KEY" ]]; then
+    query_virustotal "$IP" > /tmp/virustotal_result.$$ &
+    vt_pid=$!
+fi
+
+# Wait for background jobs to finish
+if [[ -n "$abuse_pid" ]]; then
+    wait "$abuse_pid" 2>/dev/null
+fi
+if [[ -n "$vt_pid" ]]; then
+    wait "$vt_pid" 2>/dev/null
+fi
+
+# Read results from temp files
+if [[ -n "$ABUSEIPDB_API_KEY" ]]; then
+    abuseipdb_result=$(cat /tmp/abuseipdb_result.$$ 2>/dev/null)
+    rm -f /tmp/abuseipdb_result.$$
+fi
+if [[ -n "$VT_API_KEY" ]]; then
+    virustotal_result=$(cat /tmp/virustotal_result.$$ 2>/dev/null)
+    rm -f /tmp/virustotal_result.$$
+fi
+
+# --- Parse and display results ---
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo "                 IP ENRICHMENT REPORT: $IP"
+echo "═══════════════════════════════════════════════════════════════"
+echo ""
+
+# AbuseIPDB section
+if [[ -n "$ABUSEIPDB_API_KEY" ]]; then
+    echo "── AbuseIPDB ─────────────────────────────────────────────"
+    if [[ "$abuseipdb_result" == SKIPPED ]]; then
+        echo "  (skipped, no API key)"
+    elif [[ "$abuseipdb_result" == CURL_ERROR:* ]]; then
+        warn "AbuseIPDB query failed: ${abuseipdb_result#CURL_ERROR: }"
+    elif [[ "$abuseipdb_result" == PARSE_ERROR:* ]]; then
+        warn "AbuseIPDB parse error: ${abuseipdb_result#PARSE_ERROR: }"
+    else
+        # Parse pipe-delimited fields
+        IFS='|' read -ra fields <<< "$abuseipdb_result"
+        for field in "${fields[@]}"; do
+            key="${field%%=*}"
+            value="${field#*=}"
+            printf "  %-20s: %s\n" "$key" "$value"
+        done
+    fi
+    echo ""
+fi
+
+# VirusTotal section
+if [[ -n "$VT_API_KEY" ]]; then
+    echo "── VirusTotal ────────────────────────────────────────────"
+    if [[ "$virustotal_result" == SKIPPED ]]; then
+        echo "  (skipped, no API key)"
+    elif [[ "$virustotal_result" == CURL_ERROR:* ]]; then
+        warn "VirusTotal query failed: ${virustotal_result#CURL_ERROR: }"
+    elif [[ "$virustotal_result" == PARSE_ERROR:* ]]; then
+        warn "VirusTotal parse error: ${virustotal_result#PARSE_ERROR: }"
+    else
+        IFS='|' read -ra fields <<< "$virustotal_result"
+        for field in "${fields[@]}"; do
+            key="${field%%=*}"
+            value="${field#*=}"
+            printf "  %-20s: %s\n" "$key" "$value"
+        done
+    fi
+    echo ""
+fi
+
+# --- Verdict Calculation ---
+# Extract numeric values from results
+abuse_score=0
+vt_malicious=0
+
+if [[ -n "$abuseipdb_result" && "$abuseipdb_result" != SKIPPED && "$abuseipdb_result" != CURL_ERROR:* && "$abuseipdb_result" != PARSE_ERROR:* ]]; then
+    # Extract Score field
+    score_field=$(echo "$abuseipdb_result" | grep -oP 'Score=\K[0-9]+')
+    abuse_score=${score_field:-0}
+fi
+
+if [[ -n "$virustotal_result" && "$virustotal_result" != SKIPPED && "$virustotal_result" != CURL_ERROR:* && "$virustotal_result" != PARSE_ERROR:* ]]; then
+    malicious_field=$(echo "$virustotal_result" | grep -oP 'Malicious=\K[0-9]+')
+    vt_malicious=${malicious_field:-0}
+fi
+
+# Determine verdict
+if [[ "$abuse_score" -ge 50 || "$vt_malicious" -gt 0 ]]; then
+    verdict="MALICIOUS"
+    color="$RED"
+    exit_code=2
+elif [[ "$abuse_score" -ge 30 ]]; then
+    verdict="SUSPICIOUS"
+    color="$YELLOW"
+    exit_code=1
+else
+    verdict="CLEAN"
+    color="$GREEN"
+    exit_code=0
+fi
+
+# --- Output final verdict ---
+echo "═══════════════════════════════════════════════════════════════"
+echo -e "  FINAL VERDICT: ${color}${verdict}${NC}"
+echo "═══════════════════════════════════════════════════════════════"
+echo ""
+
+exit "$exit_code"
+
+
